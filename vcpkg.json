@@ -1,6 +1,6 @@
 {
         "dependencies": [
-                "openssl"
+                "lexbor"
         ],
         "vcpkg-configuration": {
                 "overlay-ports": [
