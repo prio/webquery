@@ -1,5 +1,7 @@
 PROJ_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 
+$(shell cp ${PROJ_DIR}cmake/* ${PROJ_DIR}build/release/vcpkg_installed/x64-linux/share/lexbor/)
+
 # Configuration of extension
 EXT_NAME=webquery
 EXT_CONFIG=${PROJ_DIR}extension_config.cmake
