@@ -1,191 +1,278 @@
+#define DUCKDB_EXTENSION_MAIN
+
+#include "webquery_extension.hpp"
+
 #include "duckdb.hpp"
+#include "duckdb/common/exception.hpp"
+#include "duckdb/common/string_util.hpp"
+#include "duckdb/function/scalar_function.hpp"
+#include "duckdb/main/extension_util.hpp"
 #include "duckdb/function/table_function.hpp"
-#include "lexbor/html/html.h"
 
-namespace duckdb {
+#include <duckdb/parser/parsed_data/create_scalar_function_info.hpp>
+#include "duckdb/common/vector_operations/vector_operations.hpp"
+#include <duckdb/common/types/value.hpp>
 
-struct HTMLReadGlobalState : public GlobalTableFunctionState {
-    lxb_html_document_t *document;
+// Lexbor
+#include <lexbor/html/html.h>
+#include <lexbor/dom/dom.h>
+
+using namespace duckdb;
+using std::string;
+
+// ---------- read_html Table Function ----------
+
+struct HTMLBindData : public FunctionData {
+    explicit HTMLBindData(string html_p, string selector_p) 
+        : html(std::move(html_p)), selector(std::move(selector_p)) {}
+    string html;
+    string selector;
     
-    HTMLReadGlobalState() : document(nullptr) {}
+    unique_ptr<FunctionData> Copy() const override {
+        return make_uniq<HTMLBindData>(html, selector);
+    }
     
-    ~HTMLReadGlobalState() {
-        if (document) {
-            lxb_html_document_destroy(document);
+    bool Equals(const FunctionData &other_p) const override {
+        auto &o = (const HTMLBindData &)other_p;
+        return html == o.html && selector == o.selector;
+    }
+};
+
+struct HTMLGlobalState : public GlobalTableFunctionState {
+    vector<std::pair<lxb_dom_element_t*, string>> elements; // Store element pointer and serialized HTML
+    idx_t current_idx = 0;
+    lxb_html_document_t *doc = nullptr;
+    
+    ~HTMLGlobalState() {
+        if (doc) {
+            lxb_html_document_destroy(doc);
         }
     }
 };
 
-// Function data structures
-struct HTMLReadFunctionData : public TableFunctionData {
-    string html_content;
-    
-    HTMLReadFunctionData(string html) : html_content(std::move(html)) {}
-};
+unique_ptr<FunctionData> html_bind(ClientContext &context, TableFunctionBindInput &input,
+                                   vector<LogicalType> &return_types, vector<string> &names) {
+    if (input.inputs.size() != 2) {
+        throw InvalidInputException("read_html: expected 2 arguments (html string, css selector)");
+    }
+    string html = input.inputs[0].GetValue<string>();
+    string selector = input.inputs[1].GetValue<string>();
 
-unique_ptr<FunctionData> ReadHTMLBind(ClientContext &context, 
-                                    TableFunctionBindInput &input,
-                                    vector<LogicalType> &return_types, 
-                                    vector<string> &names) {
-
-	auto result = make_uniq<HTMLReadFunctionData>();
-
-	if (input.inputs.empty()) {
-		throw InvalidInputException("read_html requires at least one argument (file pattern)");
-	}    
-    result->html_content = input.inputs[0].ToString();
-    
-    // Define output schema - adjust based on what you want to extract
     return_types.push_back(LogicalType::VARCHAR);  // The HTML element as string
     names.emplace_back("element");
+
+    return make_uniq<HTMLBindData>(std::move(html), std::move(selector));
+}
+
+unique_ptr<GlobalTableFunctionState> html_init_global(ClientContext &context, TableFunctionInitInput &input) {
+    auto result = make_uniq<HTMLGlobalState>();
+    auto &bind_data = input.bind_data->Cast<HTMLBindData>();
+    
+    // Parse HTML
+    result->doc = lxb_html_document_create();
+    if (!result->doc) {
+        throw std::bad_alloc();
+    }
+    
+    lxb_status_t st = lxb_html_document_parse(result->doc,
+        reinterpret_cast<const lxb_char_t *>(bind_data.html.data()),
+        bind_data.html.size());
+    if (st != LXB_STATUS_OK) {
+        throw InvalidInputException("read_html: failed to parse HTML");
+    }
+    
+    // Find elements matching the selector (simple tag name matching for now)
+    lxb_dom_node_t *root = lxb_dom_interface_node(&result->doc->dom_document);
+    
+    std::function<void(lxb_dom_node_t*)> traverse = [&](lxb_dom_node_t *node) {
+        if (!node) return;
+        
+        if (node->type == LXB_DOM_NODE_TYPE_ELEMENT) {
+            lxb_dom_element_t *el = lxb_dom_interface_element(node);
+            const lxb_char_t *tag_name = lxb_dom_element_qualified_name(el, NULL);
+            
+            if (tag_name && strcmp(reinterpret_cast<const char*>(tag_name), bind_data.selector.c_str()) == 0) {
+                // Serialize element with attributes for display
+                string element_str = "<";
+                element_str += reinterpret_cast<const char*>(tag_name);
+                
+                // Get all attributes
+                lxb_dom_attr_t *attr = lxb_dom_element_first_attribute(el);
+                while (attr) {
+                    const lxb_char_t *attr_name = lxb_dom_attr_qualified_name(attr, NULL);
+                    const lxb_char_t *attr_value = lxb_dom_attr_value(attr, NULL);
+                    
+                    if (attr_name && attr_value) {
+                        element_str += " ";
+                        element_str += reinterpret_cast<const char*>(attr_name);
+                        element_str += "=\"";
+                        element_str += reinterpret_cast<const char*>(attr_value);
+                        element_str += "\"";
+                    }
+                    
+                    attr = lxb_dom_element_next_attribute(attr);
+                }
+                
+                element_str += ">";
+                
+                // Get element content
+                size_t text_len;
+                const lxb_char_t *text = lxb_dom_node_text_content(lxb_dom_interface_node(el), &text_len);
+                if (text) {
+                    element_str += reinterpret_cast<const char*>(text);
+                }
+                
+                element_str += "</";
+                element_str += reinterpret_cast<const char*>(tag_name);
+                element_str += ">";
+                
+                result->elements.push_back(std::make_pair(el, element_str));
+            }
+        }
+        
+        // Traverse children
+        lxb_dom_node_t *child = lxb_dom_node_first_child(node);
+        while (child) {
+            traverse(child);
+            child = lxb_dom_node_next(child);
+        }
+    };
+    
+    traverse(root);
     
     return std::move(result);
 }
 
-unique_ptr<GlobalTableFunctionState> ReadHTMLInit(ClientContext &context,
-                                                          TableFunctionInitInput &input) {
-    // TODO this is where files should be read from network, filesyatem etc.
-    auto bind_data = input.bind_data->Cast<HTMLReadFunctionData>();
-    auto state = make_uniq<HTMLReadGlobalState>();
+void html_main(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
+    auto &gstate = data.global_state->Cast<HTMLGlobalState>();
     
-    // Create lexbor document
-    state->document = lxb_html_document_create();
-    if (!state->document) {
-        throw InternalException("Failed to create HTML document");
+    if (gstate.current_idx >= gstate.elements.size()) {
+        output.SetCardinality(0);
+        return;
     }
     
-    // Parse the HTML content
-    lxb_status_t status = lxb_html_document_parse(state->document, 
-                                                  (const lxb_char_t*)bind_data->html_content.c_str(),
-                                                  bind_data->html_content.length());
+    idx_t count = 0;
+    idx_t remaining = gstate.elements.size() - gstate.current_idx;
+    idx_t this_batch = std::min((idx_t)STANDARD_VECTOR_SIZE, remaining);
     
-    if (status != LXB_STATUS_OK) {
-        throw InvalidInputException("Failed to parse HTML content");
+    for (idx_t i = 0; i < this_batch; i++) {
+        auto &element_pair = gstate.elements[gstate.current_idx + i];
+        output.SetValue(0, i, Value(element_pair.second)); // Use the serialized HTML string
+        count++;
     }
     
-    return std::move(state);
+    output.SetCardinality(count);
+    gstate.current_idx += count;
 }
 
-void ReadHTMLFunction(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
-    auto &state = data_p.global_state->Cast<ReadHTMLGlobalState>();
-    auto &bind_data = data_p.bind_data->Cast<HTMLReadFunctionData>();
-    
-    if (!state.document) {
-        return; // No more data
-    }
-    
-    // Example: Extract all elements and their text content
-    lxb_dom_node_t *root = lxb_dom_interface_node(lxb_html_document_body_element(state.document));
-    
-    // Traverse the DOM and populate the output chunk
-    // This is a simplified example - you'll want to implement proper traversal
-    traverse_dom_tree(root, output);
-    
-    // Mark as finished after first chunk (adjust based on your needs)
-    state.document = nullptr;
-}
+// ---------- html_attribute Scalar Function ----------
 
-void traverse_dom_tree(lxb_dom_node_t *node, DataChunk &output) {
-    // Implement DOM traversal logic here
-    // Extract tag names, text content, attributes, etc.
-    // Add rows to the output DataChunk
-}
+struct HtmlAttrFun {
+    static void Execute(DataChunk &args, ExpressionState &state, Vector &result) {
+        auto count = args.size();
+        
+        UnaryExecutor::Execute<string_t, string_t>(
+            args.data[0], result, count,
+            [&](string_t element_str) -> string_t {
+                auto element_html = element_str.GetString();
+                
+                // Extract selector and attribute from remaining args
+                // This is a simplified version - in your case, we need access to the parsed elements
+                
+                // For now, return empty string - this needs the actual element context
+                return StringVector::AddString(result, "");
+            }
+        );
+    }
+};
+
+// Simple string-based attribute extraction
+struct HtmlExtractAttrFun {
+    static void Execute(DataChunk &args, ExpressionState &state, Vector &result) {
+        auto count = args.size();
+        
+        BinaryExecutor::Execute<string_t, string_t, string_t>(
+            args.data[0], args.data[1], result, count,
+            [&](string_t element_str, string_t attr_name) -> string_t {
+                auto element_html = element_str.GetString();
+                auto attr = attr_name.GetString();
+                
+                // Simple string parsing approach
+                string search_pattern = attr + "=\"";
+                size_t start_pos = element_html.find(search_pattern);
+                
+                if (start_pos == string::npos) {
+                    return StringVector::AddString(result, "");
+                }
+                
+                start_pos += search_pattern.length();
+                size_t end_pos = element_html.find("\"", start_pos);
+                
+                if (end_pos == string::npos) {
+                    return StringVector::AddString(result, "");
+                }
+                
+                string attr_value = element_html.substr(start_pos, end_pos - start_pos);
+                return StringVector::AddString(result, attr_value);
+            }
+        );
+    }
+};
+
+// ---------- Load Functions into DuckDB ----------
 
 static void LoadInternal(DatabaseInstance &instance) {
-    // Register READ_HTML table function
-    TableFunction read_html_function(
+    // read_html table function - now takes HTML and CSS selector
+    TableFunction html_func(
         "read_html",
-        {LogicalType::VARCHAR}, // html content
-        ReadHTMLFunction,
-        ReadHTMLBind,
-        ReadHTMLInit
-    ));    
-	// read_html_function.named_parameters["ignore_errors"] = LogicalType::BOOLEAN;
-	// read_html_function.named_parameters["maximum_file_size"] = LogicalType::BIGINT;    
-    ExtensionUtil::RegisterFunction(instance, read_html_set);
-    
-    // // Register HTML_TEXT scalar function
-    // ScalarFunctionSet html_text_set("html_text");
-    // html_text_set.AddFunction(ScalarFunction(
-    //     {LogicalType::VARCHAR, LogicalType::VARCHAR}, // html, selector
-    //     LogicalType::VARCHAR, // return type
-    //     html_text_function
-    // ));
-    
-    // // Register indexed version for multi-element access
-    // html_text_set.AddFunction(ScalarFunction(
-    //     {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT}, // html, selector, index
-    //     LogicalType::VARCHAR, // return type
-    //     html_text_indexed_function
-    // ));
-    
-    // ExtensionUtil::RegisterFunction(instance, html_text_set);
-    
-    // // Register HTML_ATTRIBUTE scalar function
-    // ScalarFunctionSet html_attribute_set("html_attribute");
-    // html_attribute_set.AddFunction(ScalarFunction(
-    //     {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR}, // html, selector, attribute
-    //     LogicalType::VARCHAR, // return type
-    //     html_attribute_function
-    // ));
-    
-    // // Register indexed version for multi-element access
-    // html_attribute_set.AddFunction(ScalarFunction(
-    //     {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT}, // html, selector, attribute, index
-    //     LogicalType::VARCHAR, // return type
-    //     html_attribute_indexed_function
-    // ));
-    
-    // ExtensionUtil::RegisterFunction(instance, html_attribute_set);
-    
-    // // Register HTML_COUNT scalar function
-    // ScalarFunctionSet html_count_set("html_count");
-    // html_count_set.AddFunction(ScalarFunction(
-    //     {LogicalType::VARCHAR, LogicalType::VARCHAR}, // html, selector
-    //     LogicalType::BIGINT, // return type
-    //     html_count_function
-    // ));
-    
-    // ExtensionUtil::RegisterFunction(instance, html_count_set);
+        {LogicalType::VARCHAR, LogicalType::VARCHAR},
+        html_main,
+        html_bind,
+        html_init_global
+    );
+    ExtensionUtil::RegisterFunction(instance, html_func);
+
+    // html_attribute scalar function - extracts attribute from HTML element string
+    ScalarFunction html_attr_fun(
+        "html_attribute",
+        {LogicalType::VARCHAR, LogicalType::VARCHAR},
+        LogicalType::VARCHAR,
+        HtmlExtractAttrFun::Execute
+    );
+    ExtensionUtil::RegisterFunction(instance, html_attr_fun);
 }
 
-void WebQueryExtension::Load(DuckDB &db) {
+void WebqueryExtension::Load(DuckDB &db) {
     LoadInternal(*db.instance);
 }
 
-std::string WebQueryExtension::Name() {
+std::string WebqueryExtension::Name() {
     return "webquery";
 }
 
-} // namespace duckdb
+std::string WebqueryExtension::Version() const {
+#ifdef EXT_VERSION_WEBQUERY
+    return EXT_VERSION_WEBQUERY;
+#else
+    return "";
+#endif
+}
+
+// ---------- Entry Points ----------
 
 extern "C" {
 
 DUCKDB_EXTENSION_API void webquery_init(duckdb::DatabaseInstance &db) {
     duckdb::DuckDB db_wrapper(db);
-    db_wrapper.LoadExtension<duckdb::WebQueryExtension>();
+    db_wrapper.LoadExtension<duckdb::WebqueryExtension>();
 }
 
 DUCKDB_EXTENSION_API const char *webquery_version() {
     return duckdb::DuckDB::LibraryVersion();
 }
 
-}
+} // extern "C"
 
-// Extension entry point
 #ifndef DUCKDB_EXTENSION_MAIN
-#define DUCKDB_EXTENSION_MAIN
-
-#include "duckdb.hpp"
-
-namespace duckdb {
-
-class WebQueryExtension : public Extension {
-public:
-    void Load(DuckDB &db) override;
-    std::string Name() override;
-};
-
-} // namespace duckdb
-
+#error DUCKDB_EXTENSION_MAIN not defined
 #endif
