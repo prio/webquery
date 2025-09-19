@@ -16,6 +16,9 @@
 // Lexbor
 #include <lexbor/html/html.h>
 #include <lexbor/dom/dom.h>
+#include <lexbor/css/css.h>
+#include <lexbor/selectors/selectors.h>
+
 
 using namespace duckdb;
 using std::string;
@@ -64,6 +67,57 @@ unique_ptr<FunctionData> html_bind(ClientContext &context, TableFunctionBindInpu
     return make_uniq<HTMLBindData>(std::move(html), std::move(selector));
 }
 
+struct ElementInfo {
+    string tag;                    // HTML tag name (div, span, p, etc.)
+    lxb_dom_node_t *node;         // Pointer to the lexbor DOM node
+    string html;  // Full HTML representation
+    
+    ElementInfo() : node(nullptr) {}
+    
+    ElementInfo(string tag_name, lxb_dom_node_t *dom_node, string html_str = "") 
+        : tag(std::move(tag_name)), node(dom_node), html(std::move(html_str)) {}
+};
+
+struct CallbackData {
+    vector<ElementInfo> elements;
+    int count = 0;
+};
+
+lxb_status_t find_callback(lxb_dom_node_t *node, lxb_css_selector_specificity_t spec, void *ctx)
+{
+    // Cast context back to your data structure
+    auto *data = static_cast<CallbackData*>(ctx);
+    
+    // Extract element info
+    if (node->type == LXB_DOM_NODE_TYPE_ELEMENT) {
+        lxb_dom_element_t *element = lxb_dom_interface_element(node);
+        const lxb_char_t *tag_name = lxb_dom_element_qualified_name(element, nullptr);
+        
+        // Serialize the node and all its children
+        lexbor_str_t str = {0};        
+        lxb_status_t status = lxb_html_serialize_tree_str(node, &str);
+
+        string full_node_html;
+        if (status == LXB_STATUS_OK && str.data) {
+            full_node_html = string((char*)str.data, str.length);
+        } else {
+            // throw InvalidInputException("read_html: failed to serialise node");
+            return LXB_STATUS_ERROR;
+        }
+
+        // Store in your data structure
+        data->elements.push_back(ElementInfo(string((char*)tag_name), node, full_node_html));        
+        data->count++;
+
+        // TODO
+        // Clean up the string buffer
+        // if (str.data) {
+        //     lexbor_str_destroy(&str, nullptr, false);
+        // }        
+    }
+    return LXB_STATUS_OK;
+}
+
 unique_ptr<GlobalTableFunctionState> html_init_global(ClientContext &context, TableFunctionInitInput &input) {
     auto result = make_uniq<HTMLGlobalState>();
     auto &bind_data = input.bind_data->Cast<HTMLBindData>();
@@ -83,62 +137,68 @@ unique_ptr<GlobalTableFunctionState> html_init_global(ClientContext &context, Ta
     
     // Find elements matching the selector (simple tag name matching for now)
     lxb_dom_node_t *root = lxb_dom_interface_node(&result->doc->dom_document);
-    
-    std::function<void(lxb_dom_node_t*)> traverse = [&](lxb_dom_node_t *node) {
-        if (!node) return;
-        
-        if (node->type == LXB_DOM_NODE_TYPE_ELEMENT) {
-            lxb_dom_element_t *el = lxb_dom_interface_element(node);
-            const lxb_char_t *tag_name = lxb_dom_element_qualified_name(el, NULL);
-            
-            if (tag_name && strcmp(reinterpret_cast<const char*>(tag_name), bind_data.selector.c_str()) == 0) {
-                // Serialize element with attributes for display
-                string element_str = "<";
-                element_str += reinterpret_cast<const char*>(tag_name);
-                
-                // Get all attributes
-                lxb_dom_attr_t *attr = lxb_dom_element_first_attribute(el);
-                while (attr) {
-                    const lxb_char_t *attr_name = lxb_dom_attr_qualified_name(attr, NULL);
-                    const lxb_char_t *attr_value = lxb_dom_attr_value(attr, NULL);
-                    
-                    if (attr_name && attr_value) {
-                        element_str += " ";
-                        element_str += reinterpret_cast<const char*>(attr_name);
-                        element_str += "=\"";
-                        element_str += reinterpret_cast<const char*>(attr_value);
-                        element_str += "\"";
-                    }
-                    
-                    attr = lxb_dom_element_next_attribute(attr);
-                }
-                
-                element_str += ">";
-                
-                // Get element content
-                size_t text_len;
-                const lxb_char_t *text = lxb_dom_node_text_content(lxb_dom_interface_node(el), &text_len);
-                if (text) {
-                    element_str += reinterpret_cast<const char*>(text);
-                }
-                
-                element_str += "</";
-                element_str += reinterpret_cast<const char*>(tag_name);
-                element_str += ">";
-                
-                result->elements.push_back(std::make_pair(el, element_str));
-            }
-        }
-        
-        // Traverse children
-        lxb_dom_node_t *child = lxb_dom_node_first_child(node);
-        while (child) {
-            traverse(child);
-            child = lxb_dom_node_next(child);
-        }
-    };
-    
-    traverse(root);
+
+    /* Memory for all parsed structures. */
+    auto memory = lxb_css_memory_create();
+    auto status = lxb_css_memory_init(memory, 128);
+    if (status != LXB_STATUS_OK) {
+        throw InvalidInputException("read_html: failed to allocate memory");
+    }
+
+    /* Create CSS parser. */
+    auto parser = lxb_css_parser_create();
+    status = lxb_css_parser_init(parser, NULL);
+    if (status != LXB_STATUS_OK) {
+        throw InvalidInputException("read_html: failed to create CSS parser");
+    }
+
+    lxb_css_parser_memory_set(parser, memory);
+
+    /* Create CSS Selector parser. */
+    auto css_selectors = lxb_css_selectors_create();
+    status = lxb_css_selectors_init(css_selectors);
+    if (status != LXB_STATUS_OK) {
+        throw InvalidInputException("read_html: failed to create CSS selector parser");
+    }
+
+    /* It is important that a new selector object is not created internally
+     * for each call to the parser.
+     */
+    lxb_css_parser_selectors_set(parser, css_selectors);
+
+    /* Selectors. */
+    auto  selectors = lxb_selectors_create();
+    status = lxb_selectors_init(selectors);
+    if (status != LXB_STATUS_OK) {
+        throw InvalidInputException("read_html: failed to init selectors");
+    }    
+
+    /* Parse and get the log. */
+    const lxb_char_t* selector_ptr = (const lxb_char_t*)bind_data.selector.c_str();
+    auto list_one = lxb_css_selectors_parse(parser, selector_ptr, bind_data.selector.length());
+    if (list_one == NULL) {
+        throw InvalidInputException("read_html: failed to apply CSS parser");
+    }
+
+    /* Find HTML nodes by CSS Selectors. */
+    CallbackData callback_data;
+    status = lxb_selectors_find(selectors, root, list_one, find_callback, &callback_data);
+    if (status != LXB_STATUS_OK) {
+        throw InvalidInputException("read_html: failed to fid with selectors");
+    }    
+
+    for (const auto& elem_info : callback_data.elements) {
+        // string element_str = elem_info.tag;  
+        lxb_dom_element_t *el = lxb_dom_interface_element(elem_info.node);
+
+        // std::cout << "===========================================================================" << std::endl;
+        // std::cout << "html: " << elem_info.html << std::endl;
+        // std::cout << "===========================================================================" << std::endl;
+
+        // Create the pair and add to result
+        result->elements.push_back(std::make_pair(el, elem_info.html));
+    }    
+    (void) lxb_css_selectors_destroy(css_selectors, true);
     
     return std::move(result);
 }
@@ -232,6 +292,24 @@ static void LoadInternal(DatabaseInstance &instance) {
     );
     ExtensionUtil::RegisterFunction(instance, html_func);
 
+    // html_find scalar function - extracts attribute from HTML element string
+    ScalarFunction html_find_fun(
+        "html_find",
+        {LogicalType::VARCHAR, LogicalType::VARCHAR},
+        LogicalType::VARCHAR,
+        HtmlExtractAttrFun::Execute
+    );
+    ExtensionUtil::RegisterFunction(instance, html_find_fun);
+
+    // html_text scalar function - extracts attribute from HTML element string
+    // ScalarFunction html_text_fun(
+    //     "html_text",
+    //     {LogicalType::VARCHAR, LogicalType::VARCHAR},
+    //     LogicalType::VARCHAR,
+    //     HtmlExtractAttrFun::Execute
+    // );
+    // ExtensionUtil::RegisterFunction(instance, html_text_fun);
+    
     // html_attribute scalar function - extracts attribute from HTML element string
     ScalarFunction html_attr_fun(
         "html_attribute",
@@ -239,7 +317,8 @@ static void LoadInternal(DatabaseInstance &instance) {
         LogicalType::VARCHAR,
         HtmlExtractAttrFun::Execute
     );
-    ExtensionUtil::RegisterFunction(instance, html_attr_fun);
+    ExtensionUtil::RegisterFunction(instance, html_attr_fun);  
+    // AddAliases({"html_attr", "html_attribute"}, GetExtractFunction(), functions); 
 }
 
 void WebqueryExtension::Load(DuckDB &db) {
