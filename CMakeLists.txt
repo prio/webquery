@@ -3,7 +3,8 @@ cmake_minimum_required(VERSION 3.15)
 # Set extension name here
 set(TARGET_NAME webquery)
 
-set(lexbor_DIR cmake)
+#set(lexbor_DIR cmake)
+set(lexbor_DIR /vcpkg/packages/lexbor_${VCPKG_TARGET_TRIPLET}/share/lexbor/)
 
 # DuckDB's extension distribution supports vcpkg. As such, dependencies can be added in ./vcpkg.json and then
 # used in cmake with find_package. Feel free to remove or replace with other dependencies.
